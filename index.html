@@ -1,0 +1,448 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>Browser-Based AI Training with Batching & Robust Shaders</title>
+  <style>
+    .container { max-width: 800px; margin: 0 auto; padding: 20px; }
+    canvas { border: 1px solid #ccc; }
+    .metrics { margin-top: 20px; }
+    .error { color: red; margin-top: 10px; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>Neural Network Training Arena</h1>
+    <div class="controls">
+      <button id="startBtn">Start Training</button>
+      <label>
+        Learning Rate:
+        <input type="range" id="learningRate" min="0.001" max="0.1" step="0.001" value="0.01">
+      </label>
+      <span id="currentEpoch">Epoch: 0</span>
+      <span id="lossDisplay" style="margin-left:20px;">Loss: N/A</span>
+    </div>
+    <div class="metrics">
+      <canvas id="lossChart" width="400" height="200"></canvas>
+    </div>
+    <div id="errorLog" class="error"></div>
+  </div>
+
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <script>
+    // Neural Network using WebGPU with batching, error handling, and numerical stability improvements.
+    class NeuralNetwork {
+      constructor() {
+        this.device = null;
+        this.initialized = false;
+        // Weight buffers for 2-3-1 network (fixed sizes: 2x3 and 3x1)
+        this.weights1 = null; // 6 floats
+        this.weights2 = null; // 3 floats
+
+        // Batch buffers (batch size = 4 for the XOR dataset)
+        this.batchSize = 4;
+        this.inputBuffer = null;    // 4 examples * 2 inputs = 8 floats
+        this.targetBuffer = null;   // 4 examples * 1 = 4 floats
+        this.hiddenBuffer = null;   // 4 examples * 3 neurons = 12 floats
+        this.outputBuffer = null;   // 4 examples * 1 = 4 floats
+        this.lrBuffer = null;       // 1 float
+
+        // Compute pipelines
+        this.forwardPipeline = null;
+        this.backwardPipeline = null;
+      }
+
+      async init() {
+        try {
+          if (!navigator.gpu) {
+            throw new Error("WebGPU is not supported on this browser.");
+          }
+          const adapter = await navigator.gpu.requestAdapter();
+          if (!adapter) {
+            throw new Error("Failed to get GPU adapter.");
+          }
+          this.device = await adapter.requestDevice();
+
+          // Initialize weight buffers
+          this.weights1 = this.initWeights(2, 3); // 2x3 = 6 weights
+          this.weights2 = this.initWeights(3, 1); // 3x1 = 3 weights
+
+          // Create batch buffers
+          this.inputBuffer = this.device.createBuffer({
+            size: 8 * 4, // 8 floats
+            usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST
+          });
+          this.targetBuffer = this.device.createBuffer({
+            size: 4 * 4, // 4 floats
+            usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST
+          });
+          this.hiddenBuffer = this.device.createBuffer({
+            size: 12 * 4, // 12 floats
+            usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST
+          });
+          this.outputBuffer = this.device.createBuffer({
+            size: 4 * 4, // 4 floats
+            usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST
+          });
+          this.lrBuffer = this.device.createBuffer({
+            size: 4,
+            usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
+          });
+
+          // Initialize compute pipelines
+          await this.initPipelines();
+          this.initialized = true;
+        } catch (err) {
+          this.logError(err);
+        }
+      }
+
+      initWeights(rows, cols) {
+        const weightCount = rows * cols;
+        const weights = new Float32Array(weightCount);
+        for (let i = 0; i < weightCount; i++) {
+          weights[i] = Math.random() * 2 - 1;
+        }
+        const buffer = this.device.createBuffer({
+          size: weights.byteLength,
+          usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
+          mappedAtCreation: true
+        });
+        new Float32Array(buffer.getMappedRange()).set(weights);
+        buffer.unmap();
+        return buffer;
+      }
+
+      async initPipelines() {
+        // WGSL shader code for forward pass (batch processing)
+        const forwardShaderCode = `
+const BATCH_SIZE : u32 = 4;
+
+struct Inputs {
+  data: array<f32, BATCH_SIZE * 2>;
+};
+
+struct Weights1 {
+  data: array<f32, 6>;
+};
+
+struct Weights2 {
+  data: array<f32, 3>;
+};
+
+struct Hidden {
+  data: array<f32, BATCH_SIZE * 3>;
+};
+
+struct Outputs {
+  data: array<f32, BATCH_SIZE>;
+};
+
+@group(0) @binding(0) var<storage, read> inputs : Inputs;
+@group(0) @binding(1) var<storage, read> weights1 : Weights1;
+@group(0) @binding(2) var<storage, read> weights2 : Weights2;
+@group(0) @binding(3) var<storage, read_write> hidden : Hidden;
+@group(0) @binding(4) var<storage, read_write> outputs : Outputs;
+
+fn stable_sigmoid(x: f32) -> f32 {
+  let clamped = clamp(x, -10.0, 10.0);
+  return 1.0 / (1.0 + exp(-clamped));
+}
+
+@compute @workgroup_size(1)
+fn main() {
+  for (var b: u32 = 0u; b < BATCH_SIZE; b = b + 1u) {
+    // Compute hidden layer activations for each of 3 neurons
+    for (var i: u32 = 0u; i < 3u; i = i + 1u) {
+      var sum: f32 = 0.0;
+      for (var j: u32 = 0u; j < 2u; j = j + 1u) {
+        let inputVal = inputs.data[b * 2u + j];
+        let weight = weights1.data[j * 3u + i];
+        sum = sum + inputVal * weight;
+      }
+      hidden.data[b * 3u + i] = stable_sigmoid(sum);
+    }
+    // Compute output neuron (1 output per example)
+    var sum_out: f32 = 0.0;
+    for (var i: u32 = 0u; i < 3u; i = i + 1u) {
+      sum_out = sum_out + hidden.data[b * 3u + i] * weights2.data[i];
+    }
+    outputs.data[b] = stable_sigmoid(sum_out);
+  }
+}
+        `;
+        // WGSL shader code for backward pass (batch gradients and weight update)
+        const backwardShaderCode = `
+const BATCH_SIZE : u32 = 4;
+
+struct Inputs {
+  data: array<f32, BATCH_SIZE * 2>;
+};
+
+struct Hidden {
+  data: array<f32, BATCH_SIZE * 3>;
+};
+
+struct Outputs {
+  data: array<f32, BATCH_SIZE>;
+};
+
+struct Targets {
+  data: array<f32, BATCH_SIZE>;
+};
+
+struct Weights1 {
+  data: array<f32, 6>;
+};
+
+struct Weights2 {
+  data: array<f32, 3>;
+};
+
+struct LearningRate {
+  value: f32;
+};
+
+fn stable_sigmoid(x: f32) -> f32 {
+  let clamped = clamp(x, -10.0, 10.0);
+  return 1.0 / (1.0 + exp(-clamped));
+}
+
+fn sigmoid_derivative(sigmoid_val: f32) -> f32 {
+  return sigmoid_val * (1.0 - sigmoid_val);
+}
+
+@group(0) @binding(0) var<storage, read> inputs : Inputs;
+@group(0) @binding(1) var<storage, read> hidden : Hidden;
+@group(0) @binding(2) var<storage, read> outputs : Outputs;
+@group(0) @binding(3) var<storage, read> targets : Targets;
+@group(0) @binding(4) var<storage, read_write> weights1 : Weights1;
+@group(0) @binding(5) var<storage, read_write> weights2 : Weights2;
+@group(0) @binding(6) var<uniform> lr : LearningRate;
+
+@compute @workgroup_size(1)
+fn main() {
+  // Initialize gradient accumulators for weights (6 for weights1, 3 for weights2)
+  var gradW1 : array<f32, 6>;
+  var gradW2 : array<f32, 3>;
+  for (var i: u32 = 0u; i < 6u; i = i + 1u) {
+    gradW1[i] = 0.0;
+  }
+  for (var i: u32 = 0u; i < 3u; i = i + 1u) {
+    gradW2[i] = 0.0;
+  }
+
+  // Loop over each example in the batch
+  for (var b: u32 = 0u; b < BATCH_SIZE; b = b + 1u) {
+    let out = outputs.data[b];
+    let tgt = targets.data[b];
+    let error = (out - tgt) * sigmoid_derivative(out);
+    // Accumulate gradients for output layer weights
+    for (var i: u32 = 0u; i < 3u; i = i + 1u) {
+      gradW2[i] = gradW2[i] + error * hidden.data[b * 3u + i];
+    }
+    // Accumulate gradients for hidden layer weights
+    for (var i: u32 = 0u; i < 3u; i = i + 1u) {
+      let delta_hidden = error * weights2.data[i] * sigmoid_derivative(hidden.data[b * 3u + i]);
+      for (var j: u32 = 0u; j < 2u; j = j + 1u) {
+        let idx = j * 3u + i;
+        gradW1[idx] = gradW1[idx] + delta_hidden * inputs.data[b * 2u + j];
+      }
+    }
+  }
+
+  // Average gradients over the batch and update weights
+  let batchF = f32(BATCH_SIZE);
+  for (var i: u32 = 0u; i < 6u; i = i + 1u) {
+    gradW1[i] = gradW1[i] / batchF;
+    weights1.data[i] = weights1.data[i] - lr.value * gradW1[i];
+  }
+  for (var i: u32 = 0u; i < 3u; i = i + 1u) {
+    gradW2[i] = gradW2[i] / batchF;
+    weights2.data[i] = weights2.data[i] - lr.value * gradW2[i];
+  }
+}
+        `;
+
+        // Create shader modules and pipelines with error handling.
+        try {
+          const forwardModule = this.device.createShaderModule({ code: forwardShaderCode });
+          this.forwardPipeline = await this.device.createComputePipelineAsync({
+            layout: 'auto',
+            compute: { module: forwardModule, entryPoint: 'main' }
+          });
+
+          const backwardModule = this.device.createShaderModule({ code: backwardShaderCode });
+          this.backwardPipeline = await this.device.createComputePipelineAsync({
+            layout: 'auto',
+            compute: { module: backwardModule, entryPoint: 'main' }
+          });
+        } catch (err) {
+          this.logError(err);
+        }
+      }
+
+      // Train one step on the entire batch (XOR dataset)
+      async trainStep(batchInputs, batchTargets, learningRate) {
+        try {
+          // Write batch data to GPU buffers
+          this.device.queue.writeBuffer(this.inputBuffer, 0, batchInputs);
+          this.device.queue.writeBuffer(this.targetBuffer, 0, batchTargets);
+          this.device.queue.writeBuffer(this.lrBuffer, 0, new Float32Array([learningRate]));
+
+          // Create bind groups for forward and backward passes
+          const forwardBindGroup = this.device.createBindGroup({
+            layout: this.forwardPipeline.getBindGroupLayout(0),
+            entries: [
+              { binding: 0, resource: { buffer: this.inputBuffer } },
+              { binding: 1, resource: { buffer: this.weights1 } },
+              { binding: 2, resource: { buffer: this.weights2 } },
+              { binding: 3, resource: { buffer: this.hiddenBuffer } },
+              { binding: 4, resource: { buffer: this.outputBuffer } },
+            ]
+          });
+
+          const backwardBindGroup = this.device.createBindGroup({
+            layout: this.backwardPipeline.getBindGroupLayout(0),
+            entries: [
+              { binding: 0, resource: { buffer: this.inputBuffer } },
+              { binding: 1, resource: { buffer: this.hiddenBuffer } },
+              { binding: 2, resource: { buffer: this.outputBuffer } },
+              { binding: 3, resource: { buffer: this.targetBuffer } },
+              { binding: 4, resource: { buffer: this.weights1 } },
+              { binding: 5, resource: { buffer: this.weights2 } },
+              { binding: 6, resource: { buffer: this.lrBuffer } },
+            ]
+          });
+
+          // Create command encoder and record forward pass
+          const commandEncoder = this.device.createCommandEncoder();
+          {
+            const passEncoder = commandEncoder.beginComputePass();
+            passEncoder.setPipeline(this.forwardPipeline);
+            passEncoder.setBindGroup(0, forwardBindGroup);
+            passEncoder.dispatchWorkgroups(1);
+            passEncoder.end();
+          }
+          // Record backward pass
+          {
+            const passEncoder = commandEncoder.beginComputePass();
+            passEncoder.setPipeline(this.backwardPipeline);
+            passEncoder.setBindGroup(0, backwardBindGroup);
+            passEncoder.dispatchWorkgroups(1);
+            passEncoder.end();
+          }
+          // Create a temporary buffer to read the batch outputs for loss calculation
+          const readBuffer = this.device.createBuffer({
+            size: 4 * this.batchSize, // 4 floats
+            usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ
+          });
+          commandEncoder.copyBufferToBuffer(this.outputBuffer, 0, readBuffer, 0, 4 * this.batchSize);
+          this.device.queue.submit([commandEncoder.finish()]);
+
+          // Wait for GPU to finish and then read the outputs
+          await readBuffer.mapAsync(GPUMapMode.READ);
+          const outputArray = new Float32Array(readBuffer.getMappedRange().slice(0));
+          readBuffer.unmap();
+
+          // Calculate average squared error loss over the batch
+          let lossSum = 0;
+          for (let i = 0; i < this.batchSize; i++) {
+            const outVal = outputArray[i];
+            const tgtVal = batchTargets[i];
+            lossSum += Math.pow(outVal - tgtVal, 2);
+          }
+          const avgLoss = lossSum / this.batchSize;
+          return avgLoss;
+        } catch (err) {
+          this.logError(err);
+          return NaN;
+        }
+      }
+
+      logError(err) {
+        console.error(err);
+        const errorLog = document.getElementById('errorLog');
+        errorLog.textContent = err.message;
+      }
+    }
+
+    // Training System: Manages training loop and UI updates
+    class TrainingSystem {
+      constructor() {
+        this.nn = new NeuralNetwork();
+        this.isTraining = false;
+        this.epoch = 0;
+        this.lossHistory = [];
+        this.chart = null;
+        // Prepare batch data for the XOR problem (4 examples)
+        this.batchInputs = new Float32Array([0, 0,  0, 1,  1, 0,  1, 1]); // 8 elements
+        this.batchTargets = new Float32Array([0, 1, 1, 0]); // 4 elements
+      }
+
+      async init() {
+        await this.nn.init();
+        this.setupChart();
+        this.updateUI(NaN);
+      }
+
+      setupChart() {
+        const ctx = document.getElementById('lossChart').getContext('2d');
+        this.chart = new Chart(ctx, {
+          type: 'line',
+          data: {
+            labels: [],
+            datasets: [{
+              label: 'Training Loss',
+              data: [],
+              borderColor: 'rgb(75, 192, 192)',
+              fill: false,
+            }]
+          },
+          options: {
+            responsive: false,
+            scales: {
+              x: { title: { display: true, text: 'Epoch' } },
+              y: { title: { display: true, text: 'Loss' } }
+            }
+          }
+        });
+      }
+
+      async trainStep() {
+        if (!this.isTraining || !this.nn.initialized) return;
+        const learningRate = parseFloat(document.getElementById('learningRate').value);
+        const loss = await this.nn.trainStep(this.batchInputs, this.batchTargets, learningRate);
+        this.lossHistory.push(loss);
+        this.epoch++;
+        this.updateUI(loss);
+        requestAnimationFrame(() => this.trainStep());
+      }
+
+      updateUI(loss) {
+        document.getElementById('currentEpoch').textContent = `Epoch: ${this.epoch}`;
+        document.getElementById('lossDisplay').textContent = `Loss: ${isNaN(loss) ? "N/A" : loss.toFixed(4)}`;
+        this.chart.data.labels.push(this.epoch);
+        this.chart.data.datasets[0].data.push(loss);
+        this.chart.update();
+      }
+
+      toggleTraining() {
+        this.isTraining = !this.isTraining;
+        document.getElementById('startBtn').textContent = this.isTraining ? 'Stop Training' : 'Start Training';
+        if (this.isTraining) {
+          this.trainStep();
+        }
+      }
+    }
+
+    // Initialize training system and set up UI event listeners
+    const trainingSystem = new TrainingSystem();
+    trainingSystem.init();
+
+    document.getElementById('startBtn').addEventListener('click', () => {
+      trainingSystem.toggleTraining();
+    });
+  </script>
+</body>
+</html>
